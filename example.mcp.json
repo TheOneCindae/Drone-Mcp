@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "pixhawk": {
+      "command": "C:\\Users\\your_username\\Documents\\GitHub\\Drone-Mcp\\myenv\\Scripts\\python.exe",
+      "args": [
+        "C:\\Users\\your_username\\Documents\\GitHub\\Drone-Mcp\\server.py"
+      ]
+    }
+  }
+}

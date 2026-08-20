@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+pixhawk_mcp.log
+.pixhawk_mcp.lock
+myenv/
+.idea/
+.mcp.json
+.vscode/mcp.json
