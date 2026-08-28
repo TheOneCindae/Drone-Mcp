@@ -1,2 +1,3 @@
 pymavlink
 mcp[cli]
+pyserial

@@ -4,10 +4,16 @@ from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("pixhawk-mcp")
 
+_conn: mavutil.mavfile | None = None
+
 def connect() -> mavutil.mavfile:
-    conn = mavutil.mavlink_connection("/dev/ttyUSB0", baud=57600)
-    conn.wait_heartbeat()
-    return conn
+    global _conn
+    if _conn is None:
+        _conn = mavutil.mavlink_connection("udpin:0.0.0.0:14550", baud=57600)
+        if _conn.wait_heartbeat(timeout=10) is None:
+            _conn = None
+            raise TimeoutError("no heartbeat from vehicle within 10s")
+    return _conn
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -31,11 +37,28 @@ def _wait_for_alt(conn: mavutil.mavfile, target_m: float, tolerance: float = 0.5
     return msg, False
 
 
+def _set_mode(conn: mavutil.mavfile, mode: str) -> str:
+    """Set flight mode via MAV_CMD_DO_SET_MODE (command-long), which current
+    ArduPilot firmware requires — the legacy SET_MODE message is ignored."""
+    mode_id = conn.mode_mapping().get(mode.upper())
+    if mode_id is None:
+        return f"unknown mode '{mode}'"
+    result = _send_cmd(
+        conn, mavutil.mavlink.MAV_CMD_DO_SET_MODE,
+        mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, mode_id,
+    )
+    if result == "accepted":
+        return f"mode set to {mode.upper()}"
+    return f"mode change {result}"
+
+
 # ── Tools ──────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
 def get_telemetry() -> dict:
-    """Return current altitude (m), heading (deg), and battery voltage (V)."""
+    """Return current GPS position (lat/lon), altitude (m), heading (deg), and
+    battery voltage (V). Use this to read the drone's own coordinates when a
+    caller wants to move it but hasn't given a target lat/lon themselves."""
     conn = connect()
 
     alt_msg = conn.recv_match(type="GLOBAL_POSITION_INT", blocking=True, timeout=5)
@@ -43,6 +66,8 @@ def get_telemetry() -> dict:
     bat_msg = conn.recv_match(type="SYS_STATUS", blocking=True, timeout=5)
 
     return {
+        "lat":              round(alt_msg.lat / 1e7, 7) if alt_msg else None,
+        "lon":              round(alt_msg.lon / 1e7, 7) if alt_msg else None,
         "altitude_m":       round(alt_msg.relative_alt / 1000, 2) if alt_msg else None,
         "heading_deg":      att_msg.heading if att_msg else None,
         "battery_voltage_v": round(bat_msg.voltage_battery / 1000, 2) if bat_msg else None,
@@ -73,14 +98,7 @@ def set_mode(mode: str) -> str:
         mode: Mode name, e.g. GUIDED, LOITER, RTL, LAND, STABILIZE, ALT_HOLD.
     """
     conn = connect()
-    mode_id = conn.mode_mapping().get(mode.upper())
-    if mode_id is None:
-        return f"unknown mode '{mode}'"
-    conn.mav.set_mode_send(conn.target_system, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, mode_id)
-    ack = conn.recv_match(type="COMMAND_ACK", blocking=True, timeout=5)
-    if ack and ack.result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
-        return f"mode set to {mode.upper()}"
-    return f"mode change {ack.result if ack else 'timeout'}"
+    return _set_mode(conn, mode)
 
 
 @mcp.tool()
@@ -94,6 +112,9 @@ def goto(lat: float, lon: float, altitude_m: float) -> str:
         altitude_m: Target altitude above home in metres.
     """
     conn = connect()
+    mode_result = _set_mode(conn, "GUIDED")
+    if not mode_result.startswith("mode set to"):
+        return f"goto aborted — {mode_result}"
     conn.mav.send(mavutil.mavlink.MAVLink_set_position_target_global_int_message(
         0,
         conn.target_system, conn.target_component,
@@ -126,15 +147,15 @@ def takeoff_and_hover(target_altitude_m: float = 5.0) -> str:
     conn = connect()
 
     # 1. Set GUIDED mode
-    conn.mav.set_mode_send(
-        conn.target_system,
-        mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-        4,  # GUIDED mode number for ArduPilot
-    )
+    mode_result = _set_mode(conn, "GUIDED")
+    if not mode_result.startswith("mode set to"):
+        return f"takeoff aborted — {mode_result}"
     time.sleep(1)
 
     # 2. Arm
-    _send_cmd(conn, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 1)
+    arm_result = _send_cmd(conn, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 1)
+    if arm_result != "accepted":
+        return f"takeoff aborted — arm {arm_result}"
     time.sleep(2)
 
     # 3. Takeoff
@@ -151,10 +172,9 @@ def takeoff_and_hover(target_altitude_m: float = 5.0) -> str:
 def return_to_launch() -> str:
     """Switch to RTL mode and wait for the drone to land at the home position."""
     conn = connect()
-    mode_id = conn.mode_mapping().get("RTL")
-    if mode_id is None:
-        return "RTL mode not available"
-    conn.mav.set_mode_send(conn.target_system, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, mode_id)
+    mode_result = _set_mode(conn, "RTL")
+    if not mode_result.startswith("mode set to"):
+        return mode_result
     # Wait until altitude drops to near zero (landed)
     msg, landed = _wait_for_alt(conn, 0.0, tolerance=1.0, timeout=60)
     if landed:
